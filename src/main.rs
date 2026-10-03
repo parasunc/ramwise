@@ -8,6 +8,7 @@ mod app;
 mod collector;
 mod history;
 mod process_control;
+mod tracer;
 mod ui;
 mod utils;
 
@@ -58,6 +59,12 @@ struct Args {
     #[arg(long)]
     no_smaps: bool,
 
+    /// Opt-in allocation-tracing diagnostic: report eBPF backend
+    /// capabilities and exit. Never collects or fabricates trace data;
+    /// normal monitoring is unaffected.
+    #[arg(long)]
+    trace_alloc: bool,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -76,6 +83,14 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter("ramwise=debug")
             .init();
+    }
+
+    // Allocation-tracing diagnostic is standalone: report capabilities
+    // and exit without touching collection or the terminal.
+    if args.trace_alloc {
+        let capabilities = tracer::detect_capabilities(&tracer::DetectionRoots::default());
+        println!("{}", capabilities.report());
+        return Ok(());
     }
 
     // Setup terminal
