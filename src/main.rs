@@ -3,6 +3,7 @@
 //! A TUI application that provides deep memory introspection,
 //! intelligent insights, and beautiful visualization.
 
+mod alerts;
 mod analyzer;
 mod app;
 mod collector;
@@ -58,6 +59,23 @@ struct Args {
     #[arg(long)]
     no_smaps: bool,
 
+    /// Start with calm mode active (trend rendering paused)
+    #[arg(long)]
+    calm: bool,
+
+    /// Format alert notifications without sending them
+    #[arg(long)]
+    alert_dry_run: bool,
+
+    /// Quiet period in seconds before one alert may notify again (min 1:
+    /// zero would page every tick)
+    #[arg(long, default_value = "60")]
+    alert_cooldown_secs: u64,
+
+    /// Where alert notifications go (log = tracing/journald, stderr = status bars)
+    #[arg(long, value_enum, default_value = "log")]
+    alert_sink: AlertSinkArg,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -65,6 +83,13 @@ struct Args {
     /// Theme (by default light or dark)
     #[arg(short, long, default_value = "dark")]
     theme: String,
+}
+
+/// Alert sink selection for `--alert-sink`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AlertSinkArg {
+    Log,
+    Stderr,
 }
 
 #[tokio::main]
@@ -88,6 +113,16 @@ async fn main() -> Result<()> {
 
     // Create app
     let mut app = App::new(&args.theme);
+    app.calm.active = args.calm;
+    app.alert_dispatcher = alerts::AlertDispatcher::new(alerts::AlertConfig {
+        dry_run: args.alert_dry_run,
+        cooldown: std::time::Duration::from_secs(args.alert_cooldown_secs.max(1)),
+        sink: match args.alert_sink {
+            AlertSinkArg::Log => alerts::AlertSink::Log,
+            AlertSinkArg::Stderr => alerts::AlertSink::Stderr,
+        },
+        ..alerts::AlertConfig::default()
+    });
 
     // Create collector
     let collector = Collector::new()
@@ -176,15 +211,31 @@ async fn run_app(
                 .focused(app.focus == Focus::DetailPanel);
             frame.render_widget(detail, areas.detail_panel);
 
-            // Graph panel
-            let graph = GraphWidget::new(&app.history, &app.theme)
-                .selected_pid(app.process_list_state.selected_pid)
-                .focused(app.focus == Focus::GraphPanel);
-            frame.render_widget(graph, areas.graph_panel);
+            // Graph panel (paused in calm mode to shed render cost)
+            if app.calm.active {
+                let placeholder = Paragraph::new(" Calm mode — trend paused (c to resume)")
+                    .style(app.theme.base_style())
+                    .block(
+                        Block::default()
+                            .title(" Trend ")
+                            .borders(Borders::ALL)
+                            .border_style(app.theme.border_style(app.focus == Focus::GraphPanel)),
+                    );
+                frame.render_widget(placeholder, areas.graph_panel);
+            } else {
+                let graph = GraphWidget::new(&app.history, &app.theme)
+                    .selected_pid(app.process_list_state.selected_pid)
+                    .focused(app.focus == Focus::GraphPanel);
+                frame.render_widget(graph, areas.graph_panel);
+            }
 
             // Insights panel
             let insights = InsightsPanelWidget::new(app.analyzer.insights(), &app.theme)
                 .focused(app.focus == Focus::InsightsPanel);
+            let insights = match &app.snapshot {
+                Some(snapshot) => insights.pressure(&snapshot.system),
+                None => insights,
+            };
             frame.render_widget(insights, areas.bottom);
 
             // Help overlay
@@ -258,6 +309,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame, theme: &ui::Theme) {
 
   General:
     ?            Toggle this help
+    c            Toggle calm mode (pauses trend rendering)
     q            Quit
     Ctrl+C       Force quit
 

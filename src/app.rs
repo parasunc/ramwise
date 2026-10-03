@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::alerts::{AlertConfig, AlertDispatcher, CalmMode};
 use crate::analyzer::Analyzer;
+use crate::analyzer::{PressureThresholds, classify};
 use crate::collector::{MemorySnapshot, ProcessMemory};
 use crate::history::HistoryBuffer;
 use crate::process_control::{SignalAction, SignalResult, send_signal};
@@ -73,6 +75,10 @@ pub struct App {
     pub history: HistoryBuffer,
     /// Analyzer for insights
     pub analyzer: Analyzer,
+    /// Alert dispatcher for Warning/Critical insights
+    pub alert_dispatcher: AlertDispatcher,
+    /// Calm mode sheds expensive UI work under Critical pressure
+    pub calm: CalmMode,
     /// Process list state
     pub process_list_state: ProcessListState,
     /// Whether to show help overlay
@@ -103,6 +109,8 @@ impl App {
             snapshot: None,
             history: HistoryBuffer::default_5min(),
             analyzer: Analyzer::new(),
+            alert_dispatcher: AlertDispatcher::new(AlertConfig::default()),
+            calm: CalmMode::default(),
             process_list_state: ProcessListState::new(),
             show_help: false,
             show_kill_confirm: false,
@@ -118,6 +126,24 @@ impl App {
 
         // Run analyzer
         self.analyzer.analyze(&snapshot, &self.history);
+
+        // Dispatch alerts for fresh severe insights. Dispatch ignores calm
+        // mode by design: load shedding never suppresses notifications.
+        // Dry-run previews surface as log lines so the mode is observable.
+        let emitted = self
+            .alert_dispatcher
+            .dispatch(&self.analyzer.insights(), Instant::now());
+        if self.alert_dispatcher.is_dry_run() {
+            for message in emitted {
+                tracing::info!("{message}");
+            }
+        }
+
+        // Calm engages automatically under Critical pressure; only a manual
+        // toggle releases it, so flickering levels cannot flap the UI.
+        let critical = classify(&snapshot.system, &PressureThresholds::default())
+            == crate::analyzer::PressureLevel::Critical;
+        self.calm.auto_engage(critical);
 
         // Update sorted processes
         self.update_sorted_processes(&snapshot);
@@ -271,6 +297,9 @@ impl App {
             KeyCode::Char('s') => {
                 self.process_list_state.cycle_sort();
                 self.resort_processes();
+            }
+            KeyCode::Char('c') => {
+                self.calm.toggle();
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 if !self.sorted_processes.is_empty() {
@@ -451,5 +480,18 @@ mod tests {
 
         let app_fallback = App::new("unknown-theme");
         assert_eq!(app_fallback.theme.bg, Theme::dark().bg);
+    }
+
+    #[test]
+    fn calm_auto_engages_under_critical_pressure() {
+        let mut app = App::default();
+        assert!(!app.calm.active);
+        let mut snapshot = crate::test_support::snapshot_at(std::time::Instant::now(), 100);
+        snapshot.system.total = 100 * 1024 * 1024 * 1024;
+        snapshot.system.available = 1024 * 1024 * 1024;
+        app.update(snapshot);
+        assert!(app.calm.active);
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(!app.calm.active);
     }
 }
