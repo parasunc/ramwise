@@ -209,6 +209,7 @@ impl Collector {
 
             let mut process = ProcessMemory {
                 pid: proc.pid(),
+                start_time: stat.starttime,
                 name: stat.comm.clone(),
                 cmdline,
                 state: status.state.chars().next().unwrap_or('?'),

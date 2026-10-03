@@ -139,6 +139,10 @@ pub struct RegionMemory {
 pub struct ProcessMemory {
     /// Process ID
     pub pid: i32,
+    /// Start time in clock ticks since boot (`starttime` from /proc).
+    /// Zero means unknown. Combined with the PID it identifies a process
+    /// across snapshots so PID reuse is never silently matched.
+    pub start_time: u64,
     /// Process name (comm)
     pub name: String,
     /// Full command line
@@ -194,6 +198,7 @@ impl Default for ProcessMemory {
     fn default() -> Self {
         Self {
             pid: 0,
+            start_time: 0,
             name: String::new(),
             cmdline: String::new(),
             state: '?',
