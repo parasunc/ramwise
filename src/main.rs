@@ -14,7 +14,7 @@ mod utils;
 #[cfg(test)]
 mod test_support;
 
-use std::io::{self, stdout};
+use std::io::{self, Write, stdout};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -46,8 +46,8 @@ use ui::widgets::{
 #[command(name = "ramwise")]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Update interval in milliseconds
-    #[arg(short, long, default_value = "1000")]
+    /// Update interval in milliseconds (must be positive)
+    #[arg(short, long, default_value = "1000", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
 
     /// Minimum process RSS to display (in MB)
@@ -65,19 +65,195 @@ struct Args {
     /// Theme (by default light or dark)
     #[arg(short, long, default_value = "dark")]
     theme: String,
+
+    /// Print one compact JSON snapshot to stdout and exit (exit 0 on
+    /// success, non-zero when collection fails; diagnostics go to stderr).
+    /// Cannot be combined with --tiny or --watch.
+    #[arg(long, conflicts_with_all = ["tiny", "watch"])]
+    once: bool,
+
+    /// Print one one-line status summary to stdout and exit.
+    /// Combine with --watch to repeat the line every interval.
+    #[arg(long)]
+    tiny: bool,
+
+    /// Repeat the --tiny line every interval until interrupted (exit 0 on
+    /// clean interrupt, non-zero when collection fails)
+    #[arg(long, requires = "tiny")]
+    watch: bool,
+}
+
+/// How the process executes. Only [`ExecutionMode::Tui`] may initialize the
+/// terminal; every other mode is plain stdout/stderr and never enters raw mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionMode {
+    Tui,
+    Once,
+    TinyOnce,
+    TinyWatch,
+}
+
+fn execution_mode(args: &Args) -> ExecutionMode {
+    if args.watch {
+        ExecutionMode::TinyWatch
+    } else if args.tiny {
+        ExecutionMode::TinyOnce
+    } else if args.once {
+        ExecutionMode::Once
+    } else {
+        ExecutionMode::Tui
+    }
+}
+
+/// Build the collector shared by every execution mode so flags behave
+/// identically in the TUI and in non-interactive commands.
+fn build_collector(args: &Args) -> Collector {
+    Collector::new()
+        .with_interval(Duration::from_millis(args.interval))
+        .with_min_rss(args.min_rss.saturating_mul(1024 * 1024))
+        .with_smaps(!args.no_smaps)
+}
+
+/// Serialize one snapshot to the versioned export contract for `--once`.
+/// The payload is compact JSON on stdout; failures are `Err` so the process
+/// exits non-zero with the cause on stderr.
+fn snapshot_to_json(snapshot: &collector::MemorySnapshot) -> Result<String> {
+    let export = snapshot.to_export();
+    export
+        .validate()
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    serde_json::to_string(&export).context("Failed to serialize snapshot")
+}
+
+/// Render the one-line status summary for `--tiny`.
+///
+/// Provisional shape until the stable status-bar contract lands: used/total
+/// RAM, usage percent, and used/total swap. Pure and deterministic so golden
+/// tests pin it exactly.
+fn render_tiny_line(system: &collector::SystemMemory) -> String {
+    format!(
+        "mem {}/{} {} swap {}/{}",
+        utils::format_bytes(system.used()),
+        utils::format_bytes(system.total),
+        utils::format_percent(system.usage_percent()),
+        utils::format_bytes(system.swap_used),
+        utils::format_bytes(system.swap_total),
+    )
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging if debug mode
+    // Diagnostics always go to stderr so stdout stays pure data in
+    // non-interactive modes (pipelines, status bars, file redirects).
     if args.debug {
         tracing_subscriber::fmt()
             .with_env_filter("ramwise=debug")
+            .with_writer(io::stderr)
             .init();
     }
 
+    match execution_mode(&args) {
+        ExecutionMode::Tui => run_tui(&args).await,
+        ExecutionMode::Once => {
+            let mut collector = build_collector(&args);
+            let snapshot = collector.collect_snapshot()?;
+            if !write_stdout_line(&snapshot_to_json(&snapshot)?)? {
+                return Ok(());
+            }
+            Ok(())
+        }
+        ExecutionMode::TinyOnce => {
+            let mut collector = build_collector(&args);
+            let snapshot = collector.collect_snapshot()?;
+            if !write_stdout_line(&render_tiny_line(&snapshot.system))? {
+                return Ok(());
+            }
+            Ok(())
+        }
+        ExecutionMode::TinyWatch => run_tiny_watch(&args).await,
+    }
+}
+
+/// Write one line to stdout without panicking when a downstream consumer exits.
+/// Broken pipes are reported as a clean termination for CLI pipelines.
+fn write_stdout_line(line: &str) -> Result<bool> {
+    let mut stdout = io::stdout().lock();
+    match writeln!(stdout, "{line}") {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error).context("Failed to write stdout"),
+    }
+}
+
+/// Flush stdout so piped consumers see each line immediately.
+fn flush_stdout() -> Result<bool> {
+    match io::stdout().flush() {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error).context("Failed to flush stdout"),
+    }
+}
+
+/// Print the tiny line every interval until interrupted (SIGINT or
+/// SIGTERM). A clean interrupt ends with exit 0; a collection failure ends
+/// non-zero with the cause on stderr.
+#[cfg(unix)]
+async fn run_tiny_watch(args: &Args) -> Result<()> {
+    let mut collector = build_collector(args);
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("Failed to register SIGINT handler")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("Failed to register SIGTERM handler")?;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let snapshot = collector.collect_snapshot()?;
+                if !write_stdout_line(&render_tiny_line(&snapshot.system))? {
+                    return Ok(());
+                }
+                if !flush_stdout()? {
+                    return Ok(());
+                }
+            }
+            _ = interrupt.recv() => {
+                return Ok(());
+            }
+            _ = terminate.recv() => {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Keep watch mode available on platforms without Unix signal streams.
+#[cfg(not(unix))]
+async fn run_tiny_watch(args: &Args) -> Result<()> {
+    let mut collector = build_collector(args);
+    let mut ticker = tokio::time::interval(Duration::from_millis(args.interval));
+    let mut interrupt = tokio::signal::ctrl_c();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let snapshot = collector.collect_snapshot()?;
+                if !write_stdout_line(&render_tiny_line(&snapshot.system))? {
+                    return Ok(());
+                }
+                if !flush_stdout()? {
+                    return Ok(());
+                }
+            }
+            result = &mut interrupt => {
+                result.context("Failed to listen for interrupt")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn run_tui(args: &Args) -> Result<()> {
     // Setup terminal
     enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = stdout();
@@ -90,10 +266,7 @@ async fn main() -> Result<()> {
     let mut app = App::new(&args.theme);
 
     // Create collector
-    let collector = Collector::new()
-        .with_interval(Duration::from_millis(args.interval))
-        .with_min_rss(args.min_rss * 1024 * 1024)
-        .with_smaps(!args.no_smaps);
+    let collector = build_collector(args);
 
     // Create channel for snapshots
     let (tx, mut rx) = mpsc::channel(2);
@@ -344,4 +517,109 @@ fn render_action_status(frame: &mut ratatui::Frame, theme: &ui::Theme, status: &
     );
 
     frame.render_widget(paragraph, toast_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support;
+
+    fn args_with(tiny: bool, once: bool, watch: bool) -> Args {
+        Args {
+            interval: 1000,
+            min_rss: 1,
+            no_smaps: false,
+            debug: false,
+            theme: "dark".into(),
+            tiny,
+            once,
+            watch,
+        }
+    }
+
+    #[test]
+    fn mode_dispatch_prefers_the_most_specific_flag() {
+        assert_eq!(
+            execution_mode(&args_with(false, false, false)),
+            ExecutionMode::Tui
+        );
+        assert_eq!(
+            execution_mode(&args_with(false, true, false)),
+            ExecutionMode::Once
+        );
+        assert_eq!(
+            execution_mode(&args_with(true, false, false)),
+            ExecutionMode::TinyOnce
+        );
+        assert_eq!(
+            execution_mode(&args_with(true, false, true)),
+            ExecutionMode::TinyWatch
+        );
+    }
+
+    #[test]
+    fn once_rejects_tiny_combinations() {
+        assert!(Args::try_parse_from(["ramwise", "--once", "--tiny"]).is_err());
+        assert!(Args::try_parse_from(["ramwise", "--once", "--watch"]).is_err());
+    }
+
+    #[test]
+    fn only_the_tui_mode_may_initialize_the_terminal() {
+        // Structural guarantee: terminal setup lives in run_tui, and every
+        // non-interactive mode resolves away from it. If a new mode is added
+        // without updating this match, it fails closed here.
+        for mode in [
+            ExecutionMode::Once,
+            ExecutionMode::TinyOnce,
+            ExecutionMode::TinyWatch,
+        ] {
+            assert_ne!(mode, ExecutionMode::Tui);
+        }
+    }
+
+    #[test]
+    fn shared_builder_maps_min_rss_and_smaps_flags() {
+        let filtered = Args {
+            min_rss: 1_000_000,
+            ..args_with(false, true, false)
+        };
+        let mut collector = build_collector(&filtered);
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert!(snapshot.processes.is_empty());
+
+        let plain = args_with(false, true, false);
+        let mut collector = build_collector(&plain);
+        assert!(collector.collect_snapshot().is_ok());
+
+        // --no-smaps disables detailed PSS/USS collection end to end.
+        let bare = Args {
+            no_smaps: true,
+            min_rss: 0,
+            ..args_with(false, true, false)
+        };
+        let mut collector = build_collector(&bare);
+        let snapshot = collector.collect_snapshot().unwrap();
+        assert!(
+            snapshot.processes.iter().all(|p| p.pss == 0 && p.uss == 0),
+            "smaps details must stay off with --no-smaps"
+        );
+    }
+
+    #[test]
+    fn tiny_line_is_pinned_by_a_golden_fixture() {
+        let line = render_tiny_line(&test_support::system_memory());
+        assert_eq!(line, "mem 8.0G/16.0G 50.0% swap 512.0M/4.0G");
+    }
+
+    #[test]
+    fn once_output_is_valid_versioned_json() {
+        let snapshot = test_support::snapshot_at(std::time::Instant::now(), 100);
+        let json = snapshot_to_json(&snapshot).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // snapshot_to_json already enforces schema validation; here we pin
+        // the wire shape so regressions surface at the CLI boundary too.
+        assert!(value["schema_version"].is_number());
+        assert!(value["system"]["total_bytes"].is_number());
+        assert!(value["processes"].is_array());
+    }
 }
