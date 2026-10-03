@@ -5,10 +5,12 @@
 
 mod engine;
 mod insights;
+mod pressure;
 mod rules;
 
 pub use engine::Analyzer;
 pub use insights::{Insight, Severity};
+pub use pressure::{PressureLevel, PressureThresholds, classify, explain};
 // Rule trait exported for extensibility
 #[allow(unused_imports)]
 pub use rules::Rule;
