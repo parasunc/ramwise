@@ -10,6 +10,7 @@ mod history;
 mod process_control;
 mod ui;
 mod utils;
+mod vram;
 
 #[cfg(test)]
 mod test_support;
@@ -58,6 +59,11 @@ struct Args {
     #[arg(long)]
     no_smaps: bool,
 
+    /// Report GPU VRAM provider capabilities and exit. The core collector
+    /// never depends on drivers or vendor tools.
+    #[arg(long)]
+    vram: bool,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -76,6 +82,12 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter("ramwise=debug")
             .init();
+    }
+
+    // VRAM capability diagnostic is standalone.
+    if args.vram {
+        println!("{}", vram::report(std::env::var_os("PATH")));
+        return Ok(());
     }
 
     // Setup terminal
