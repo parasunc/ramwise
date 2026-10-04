@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::analyzer::Analyzer;
 use crate::collector::{MemorySnapshot, ProcessMemory};
+use crate::external_tools::{CommandSpec, ExternalTool, ToolError, build_command};
 use crate::history::HistoryBuffer;
 use crate::process_control::{SignalAction, SignalResult, send_signal};
 use crate::ui::Theme;
@@ -79,6 +80,11 @@ pub struct App {
     pub show_help: bool,
     /// Whether SIGKILL confirmation dialog is visible
     pub show_kill_confirm: bool,
+    /// External-tool launch awaiting explicit confirmation
+    pub pending_tool: Option<(ExternalTool, i32, CommandSpec)>,
+    /// Validated command the TUI owner should spawn (effect: suspend the
+    /// TUI, run it, resume, then call [`App::complete_spawn`]).
+    pub pending_spawn: Option<(ExternalTool, i32, CommandSpec)>,
     /// Transient status for process action feedback
     pub action_status: Option<ActionStatus>,
     /// Sorted processes (cached)
@@ -106,6 +112,8 @@ impl App {
             process_list_state: ProcessListState::new(),
             show_help: false,
             show_kill_confirm: false,
+            pending_tool: None,
+            pending_spawn: None,
             action_status: None,
             sorted_processes: Vec::new(),
         }
@@ -219,6 +227,10 @@ impl App {
             self.handle_kill_confirm_key(key);
             return;
         }
+        if self.pending_tool.is_some() {
+            self.handle_tool_confirm_key(key);
+            return;
+        }
 
         // Global keys
         match (key, modifiers) {
@@ -289,6 +301,9 @@ impl App {
             KeyCode::Char('x') => {
                 self.signal_selected_process(SignalAction::Terminate);
             }
+            KeyCode::Char('H') => self.request_tool(ExternalTool::Htop),
+            KeyCode::Char('R') => self.request_tool(ExternalTool::Strace),
+            KeyCode::Char('V') => self.request_tool(ExternalTool::Valgrind),
             KeyCode::Char('X') => {
                 if self.selected_process().is_none() {
                     self.set_status(ActionStatusKind::Warning, "No process selected");
@@ -328,6 +343,70 @@ impl App {
                 self.set_status(ActionStatusKind::Warning, "Kill action canceled");
             }
             _ => {}
+        }
+    }
+
+    /// Validate an external tool against the selected process and stage it
+    /// for explicit confirmation. Missing binaries and bad targets report
+    /// through the status mechanism immediately — no modal, no launch.
+    pub fn request_tool(&mut self, tool: ExternalTool) {
+        let Some(process) = self.selected_process() else {
+            self.set_status(ActionStatusKind::Warning, "No process selected");
+            return;
+        };
+        match build_command(tool, process, std::env::var_os("PATH")) {
+            Ok(spec) => self.pending_tool = Some((tool, process.pid, spec)),
+            Err(ToolError::MissingBinary(name)) => self.set_status(
+                ActionStatusKind::Warning,
+                format!("{name} is not installed; install it to use this action"),
+            ),
+            Err(ToolError::UnsupportedTarget(reason)) => {
+                self.set_status(ActionStatusKind::Warning, reason);
+            }
+        }
+    }
+
+    fn handle_tool_confirm_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Enter => {
+                if let Some((tool, pid, spec)) = self.pending_tool.take() {
+                    self.pending_spawn = Some((tool, pid, spec));
+                }
+            }
+            KeyCode::Esc => {
+                self.pending_tool = None;
+                self.set_status(ActionStatusKind::Warning, "Tool action canceled");
+            }
+            _ => {}
+        }
+    }
+
+    /// Report a finished spawn through the status mechanism. Permission and
+    /// launch failures arrive here as `Err` with the OS message preserved.
+    pub fn complete_spawn(
+        &mut self,
+        tool: ExternalTool,
+        result: std::io::Result<std::process::ExitStatus>,
+    ) {
+        match result {
+            Ok(status) if status.success() => self.set_status(
+                ActionStatusKind::Success,
+                format!("{} finished", tool.name()),
+            ),
+            Ok(status) => self.set_status(
+                ActionStatusKind::Warning,
+                format!(
+                    "{} exited with {}",
+                    tool.name(),
+                    status
+                        .code()
+                        .map_or("signal".to_string(), |code| code.to_string())
+                ),
+            ),
+            Err(error) => self.set_status(
+                ActionStatusKind::Error,
+                format!("failed to run {}: {error}", tool.name()),
+            ),
         }
     }
 
@@ -451,5 +530,79 @@ mod tests {
 
         let app_fallback = App::new("unknown-theme");
         assert_eq!(app_fallback.theme.bg, Theme::dark().bg);
+    }
+
+    #[test]
+    fn tool_request_without_selection_warns() {
+        let mut app = App::default();
+        app.request_tool(ExternalTool::Htop);
+        assert!(app.pending_tool.is_none());
+        assert!(matches!(
+            app.action_status.as_ref().map(|s| s.kind),
+            Some(ActionStatusKind::Warning)
+        ));
+    }
+
+    #[test]
+    fn tool_confirm_moves_spec_to_spawn_and_cancel_clears() {
+        let mut app = App {
+            pending_tool: Some((
+                ExternalTool::Htop,
+                7,
+                CommandSpec {
+                    program: "/usr/bin/htop".into(),
+                    args: vec!["-p".into(), "7".into()],
+                },
+            )),
+            ..Default::default()
+        };
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.pending_tool.is_none());
+        let (tool, pid, spec) = app.pending_spawn.take().unwrap();
+        assert_eq!(tool, ExternalTool::Htop);
+        assert_eq!(pid, 7);
+        assert_eq!(spec.args, vec!["-p".to_string(), "7".to_string()]);
+
+        app.pending_tool = Some((
+            ExternalTool::Strace,
+            8,
+            CommandSpec {
+                program: "/usr/bin/strace".into(),
+                args: vec![],
+            },
+        ));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.pending_tool.is_none());
+        assert!(app.pending_spawn.is_none());
+    }
+
+    #[test]
+    fn spawn_results_report_through_status() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut app = App::default();
+        app.complete_spawn(
+            ExternalTool::Htop,
+            Ok(std::process::ExitStatus::from_raw(0)),
+        );
+        assert!(matches!(
+            app.action_status.as_ref().map(|s| s.kind),
+            Some(ActionStatusKind::Success)
+        ));
+        app.complete_spawn(
+            ExternalTool::Strace,
+            Ok(std::process::ExitStatus::from_raw(1 << 8)),
+        );
+        assert!(matches!(
+            app.action_status.as_ref().map(|s| s.kind),
+            Some(ActionStatusKind::Warning)
+        ));
+        app.complete_spawn(
+            ExternalTool::Valgrind,
+            Err(std::io::Error::from_raw_os_error(13)),
+        );
+        assert!(matches!(
+            app.action_status.as_ref().map(|s| s.kind),
+            Some(ActionStatusKind::Error)
+        ));
     }
 }
