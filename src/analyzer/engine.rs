@@ -10,8 +10,8 @@ use crate::history::HistoryBuffer;
 
 use super::insights::Insight;
 use super::rules::{
-    CacheInfoRule, FragmentationDetector, MemoryHogDetector, MemoryLeakDetector, OomRiskDetector,
-    Rule, SuddenSpikeDetector, SwapPressureDetector,
+    CacheInfoRule, FragmentationDetector, LeakScoreRule, MemoryHogDetector, MemoryLeakDetector,
+    OomRiskDetector, Rule, SuddenSpikeDetector, SwapPressureDetector,
 };
 
 /// The main analyzer that runs all rules
@@ -34,6 +34,7 @@ impl Analyzer {
         Self {
             rules: vec![
                 Box::new(MemoryLeakDetector::default()),
+                Box::new(LeakScoreRule::default()),
                 Box::new(MemoryHogDetector::default()),
                 Box::new(SuddenSpikeDetector::default()),
                 Box::new(OomRiskDetector::default()),

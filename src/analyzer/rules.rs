@@ -2,12 +2,13 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::collector::MemorySnapshot;
 use crate::history::HistoryBuffer;
 
 use super::insights::{Insight, Severity};
+use super::leak_score::{LeakBand, LeakScoreInput, leak_score};
 
 /// Trait for analysis rules
 pub trait Rule: Send + Sync {
@@ -328,6 +329,107 @@ impl Rule for FragmentationDetector {
     }
 }
 
+/// Graded leak assessment complementing the binary [`MemoryLeakDetector`].
+///
+/// Where the binary detector fires on a growth threshold, this rule reports
+/// the calibrated 0–100 score with its components, so borderline cases show
+/// *why* they are (or are not) convincing. Only scores at or above
+/// `min_score` produce insights. The 10 MB floor is deliberately more
+/// sensitive than the binary detector's 50 MB: grading weak evidence is
+/// safe, paging on it is not.
+///
+/// Both detectors may fire on a strong leak with distinct insight IDs
+/// (`leak_` vs `leak_score_`); the score explains the binary trip.
+pub struct LeakScoreRule {
+    /// Minimum score to report.
+    pub min_score: u8,
+    /// History window to score over.
+    pub window: Duration,
+    /// Minimum peak RSS to consider (ignore small processes).
+    pub min_size_bytes: u64,
+}
+
+impl Default for LeakScoreRule {
+    fn default() -> Self {
+        Self {
+            min_score: 50,
+            window: Duration::from_secs(300),
+            min_size_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+impl Rule for LeakScoreRule {
+    fn name(&self) -> &'static str {
+        "leak_score_rule"
+    }
+
+    fn evaluate(&self, snapshot: &MemorySnapshot, history: &HistoryBuffer) -> Option<Insight> {
+        for proc in &snapshot.processes {
+            if proc.rss < self.min_size_bytes {
+                continue;
+            }
+            let trend = history.process_trend(proc.pid);
+            if trend.len() < 3 {
+                continue;
+            }
+            // Score only the configured trailing window: ancient history
+            // must not dilute (or rescue) recent behavior.
+            let last = trend
+                .last()
+                .map(|(timestamp, _)| *timestamp)
+                .unwrap_or_else(Instant::now);
+            let cutoff = last.checked_sub(self.window).unwrap_or_else(|| trend[0].0);
+            let windowed: Vec<(Instant, u64)> = trend
+                .into_iter()
+                .filter(|(timestamp, _)| *timestamp >= cutoff)
+                .collect();
+            if windowed.len() < 3 {
+                continue;
+            }
+            let rss: Vec<u64> = windowed.iter().map(|(_, value)| *value).collect();
+            let duration = windowed
+                .last()
+                .map(|(end, _)| end.saturating_duration_since(windowed[0].0))
+                .unwrap_or(Duration::ZERO);
+            let assessed = leak_score(LeakScoreInput {
+                rss: &rss,
+                duration,
+                min_size_bytes: self.min_size_bytes,
+            });
+            if assessed.score >= self.min_score {
+                return Some(
+                    Insight::new(
+                        format!("leak_score_{}_{}", proc.pid, proc.name),
+                        if assessed.band == LeakBand::Severe {
+                            Severity::Critical
+                        } else {
+                            Severity::Warning
+                        },
+                        format!(
+                            "Leak score {}/100 ({})",
+                            assessed.score,
+                            assessed.band.label()
+                        ),
+                        format!(
+                            "RSS {} → {} (growth {:.0}%, monotonicity {:.0}%, stability {:.0}%)",
+                            format_bytes(rss[0]),
+                            format_bytes(rss[rss.len() - 1]),
+                            assessed.growth * 100.0,
+                            assessed.monotonicity * 100.0,
+                            assessed.stability * 100.0,
+                        ),
+                        "Sustained climb with low noise. Investigate allocations before it becomes critical."
+                            .to_string(),
+                    )
+                    .with_process(proc.pid, proc.insight_name()),
+                );
+            }
+        }
+        None
+    }
+}
+
 /// Informational insight about page cache
 pub struct CacheInfoRule;
 
@@ -426,5 +528,96 @@ mod tests {
                 .evaluate(&snapshot, &history)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn leak_score_rule_grades_growth_and_ignores_stable() {
+        use crate::collector::ProcessMemory;
+        let base = std::time::Instant::now();
+        let mut history = HistoryBuffer::new(20, Duration::from_secs(600));
+        for index in 0..10 {
+            let rss = 20 * 1024 * 1024 + index * 2 * 1024 * 1024;
+            history.push(&crate::collector::MemorySnapshot {
+                timestamp: base + Duration::from_secs(index),
+                system: crate::collector::SystemMemory::default(),
+                processes: vec![ProcessMemory {
+                    pid: 777,
+                    name: "leaky".into(),
+                    rss,
+                    vss: rss,
+                    ..Default::default()
+                }],
+                total_processes: 1,
+                running_processes: 1,
+            });
+        }
+        let mut snapshot = test_support::snapshot_at(
+            std::time::Instant::now(),
+            20 * 1024 * 1024 + 9 * 2 * 1024 * 1024,
+        );
+        snapshot.processes[0].pid = 777;
+        let insight = LeakScoreRule::default()
+            .evaluate(&snapshot, &history)
+            .unwrap();
+        assert!(insight.id.starts_with("leak_score_777"));
+        assert!(insight.title.contains("/100"));
+
+        let calm_history = HistoryBuffer::new(4, Duration::from_secs(60));
+        assert!(
+            LeakScoreRule::default()
+                .evaluate(&snapshot, &calm_history)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn leak_score_rule_scores_only_the_trailing_window() {
+        use crate::collector::ProcessMemory;
+        let base = std::time::Instant::now();
+        let mut history = HistoryBuffer::new(30, Duration::from_secs(600));
+        // Ancient flat history must not rescue recent growth from scoring:
+        // the rule sees only the last `window`.
+        for index in 0..10u64 {
+            history.push(&crate::collector::MemorySnapshot {
+                timestamp: base + Duration::from_secs(index),
+                system: crate::collector::SystemMemory::default(),
+                processes: vec![ProcessMemory {
+                    pid: 778,
+                    name: "grower".into(),
+                    rss: 20 * 1024 * 1024,
+                    vss: 20 * 1024 * 1024,
+                    ..Default::default()
+                }],
+                total_processes: 1,
+                running_processes: 1,
+            });
+        }
+        for index in 0..10u64 {
+            let rss = 20 * 1024 * 1024 + index * 2 * 1024 * 1024;
+            history.push(&crate::collector::MemorySnapshot {
+                timestamp: base + Duration::from_secs(400 + index),
+                system: crate::collector::SystemMemory::default(),
+                processes: vec![ProcessMemory {
+                    pid: 778,
+                    name: "grower".into(),
+                    rss,
+                    vss: rss,
+                    ..Default::default()
+                }],
+                total_processes: 1,
+                running_processes: 1,
+            });
+        }
+        let mut snapshot = test_support::snapshot_at(
+            std::time::Instant::now(),
+            20 * 1024 * 1024 + 9 * 2 * 1024 * 1024,
+        );
+        snapshot.processes[0].pid = 778;
+        let rule = LeakScoreRule {
+            window: Duration::from_secs(60),
+            ..LeakScoreRule::default()
+        };
+        let insight = rule.evaluate(&snapshot, &history).unwrap();
+        assert!(insight.id.starts_with("leak_score_778"));
     }
 }
