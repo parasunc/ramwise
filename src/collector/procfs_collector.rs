@@ -94,7 +94,7 @@ impl Collector {
     ///
     /// `/proc/meminfo` is required: without it there is no snapshot. The
     /// vmstat and pressure inputs are best-effort instead — a missing file
-    /// leaves cumulative counters at zero, rates at unknown, and pressure
+    /// leaves cumulative counters and rates unknown, and pressure
     /// averages absent, which the export contract marks as explicit
     /// capability gaps.
     fn collect_system_memory(&mut self) -> Result<SystemMemory> {
@@ -135,7 +135,10 @@ impl Collector {
     /// against the previous reading, and store the new baseline.
     /// Separated from meminfo so tests drive it with fixture paths and
     /// explicit timestamps, without depending on live /proc/meminfo.
-    fn update_swap_tracking(&mut self, now: Instant) -> (u64, u64, Option<f64>, Option<f64>) {
+    fn update_swap_tracking(
+        &mut self,
+        now: Instant,
+    ) -> (Option<u64>, Option<u64>, Option<f64>, Option<f64>) {
         let current = read_vmstat_sample(&self.vmstat_path)
             .ok()
             .map(|sample| TimedSample { sample, at: now });
@@ -151,7 +154,7 @@ impl Collector {
                 rates.map(|rates| rates.in_per_sec),
                 rates.map(|rates| rates.out_per_sec),
             ),
-            None => (0, 0, None, None),
+            None => (None, None, None, None),
         }
     }
 
@@ -402,8 +405,8 @@ mod tests {
         collector.vmstat_path = vmstat;
         collector.pressure_path = pressure;
         let snapshot = collector.collect_snapshot().unwrap();
-        assert_eq!(snapshot.system.swap_in_pages, 1200);
-        assert_eq!(snapshot.system.swap_out_pages, 3400);
+        assert_eq!(snapshot.system.swap_in_pages, Some(1200));
+        assert_eq!(snapshot.system.swap_out_pages, Some(3400));
         assert_eq!(snapshot.system.swap_in_rate, None);
         assert_eq!(snapshot.system.pressure.some_avg10, Some(1.25));
         assert_eq!(snapshot.system.pressure.full_avg300, Some(0.02));
@@ -419,7 +422,7 @@ mod tests {
         collector.pressure_path = PathBuf::from("/nonexistent-ramwise-fixture/pressure");
         let start = Instant::now();
         let (in_pages, out_pages, in_rate, out_rate) = collector.update_swap_tracking(start);
-        assert_eq!((in_pages, out_pages), (1000, 2000));
+        assert_eq!((in_pages, out_pages), (Some(1000), Some(2000)));
         assert_eq!((in_rate, out_rate), (None, None));
 
         std::fs::write(&vmstat, "pswpin 1100\npswpout 2200\n").unwrap();
@@ -437,7 +440,7 @@ mod tests {
         collector.vmstat_path = missing.join("vmstat");
         collector.pressure_path = missing.join("pressure");
         let snapshot = collector.collect_snapshot().unwrap();
-        assert_eq!(snapshot.system.swap_in_pages, 0);
+        assert_eq!(snapshot.system.swap_in_pages, None);
         assert_eq!(snapshot.system.swap_in_rate, None);
         assert!(!snapshot.system.pressure.is_available());
     }

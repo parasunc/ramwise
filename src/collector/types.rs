@@ -50,10 +50,10 @@ pub struct SystemMemory {
     pub swap_total: u64,
     /// Used swap space
     pub swap_used: u64,
-    /// Cumulative pages swapped in (`pswpin` from /proc/vmstat); zero when unavailable
-    pub swap_in_pages: u64,
-    /// Cumulative pages swapped out (`pswpout` from /proc/vmstat); zero when unavailable
-    pub swap_out_pages: u64,
+    /// Cumulative pages swapped in (`pswpin` from /proc/vmstat); `None` when unavailable
+    pub swap_in_pages: Option<u64>,
+    /// Cumulative pages swapped out (`pswpout` from /proc/vmstat); `None` when unavailable
+    pub swap_out_pages: Option<u64>,
     /// Swap-in rate in pages per second; `None` on the first sample or when
     /// vmstat is unreadable, so unknown is never confused with idle
     pub swap_in_rate: Option<f64>,

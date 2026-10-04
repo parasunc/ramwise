@@ -47,9 +47,9 @@ pub struct ExportSystemMemory {
     pub swap_used_bytes: u64,
     /// Added after schema 1 shipped: defaulted on read so older files parse.
     #[serde(default)]
-    pub swap_in_pages: u64,
+    pub swap_in_pages: Option<u64>,
     #[serde(default)]
-    pub swap_out_pages: u64,
+    pub swap_out_pages: Option<u64>,
     pub swap_in_rate_per_sec: Option<f64>,
     pub swap_out_rate_per_sec: Option<f64>,
     pub slab_bytes: u64,
@@ -461,7 +461,7 @@ mod tests {
             system.remove(field);
         }
         let decoded: ExportSnapshot = serde_json::from_value(json).unwrap();
-        assert_eq!(decoded.system.swap_in_pages, 0);
+        assert_eq!(decoded.system.swap_in_pages, None);
         assert_eq!(decoded.system.kernel_stack_bytes, 0);
         assert_eq!(decoded.system.pressure_full_avg300, None);
         assert!(decoded.validate().is_ok());
@@ -470,15 +470,15 @@ mod tests {
     #[test]
     fn present_rates_and_pressure_mark_capabilities_available() {
         let mut snapshot = MemorySnapshot::default();
-        snapshot.system.swap_in_pages = 1200;
-        snapshot.system.swap_out_pages = 3400;
+        snapshot.system.swap_in_pages = Some(1200);
+        snapshot.system.swap_out_pages = Some(3400);
         snapshot.system.swap_in_rate = Some(10.0);
         snapshot.system.swap_out_rate = Some(20.0);
         snapshot.system.pressure.some_avg10 = Some(1.25);
         let export = ExportSnapshot::from_runtime(&snapshot);
         assert_eq!(export.capabilities["swap_rates"], Capability::Available);
         assert_eq!(export.capabilities["pressure"], Capability::Available);
-        assert_eq!(export.system.swap_in_pages, 1200);
+        assert_eq!(export.system.swap_in_pages, Some(1200));
         assert_eq!(export.system.swap_in_rate_per_sec, Some(10.0));
         assert_eq!(export.system.pressure_some_avg10, Some(1.25));
         assert!(export.validate().is_ok());

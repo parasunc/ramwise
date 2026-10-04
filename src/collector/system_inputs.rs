@@ -18,9 +18,9 @@ use super::types::MemoryPressure;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VmstatSample {
     /// Cumulative pages swapped in.
-    pub pswpin: u64,
+    pub pswpin: Option<u64>,
     /// Cumulative pages swapped out.
-    pub pswpout: u64,
+    pub pswpout: Option<u64>,
 }
 
 /// A [`VmstatSample`] pinned to the moment it was read.
@@ -38,15 +38,18 @@ pub struct SwapRates {
 }
 
 /// Parse `/proc/vmstat`-formatted text. Unknown or malformed lines are
-/// ignored; missing `pswpin`/`pswpout` keys read as zero.
+/// ignored; missing or invalid `pswpin`/`pswpout` keys remain unavailable.
 pub fn parse_vmstat(text: &str) -> VmstatSample {
-    let mut sample = VmstatSample::default();
+    let mut sample = VmstatSample {
+        pswpin: None,
+        pswpout: None,
+    };
     for line in text.lines() {
         let mut parts = line.split_whitespace();
         let (Some(key), Some(raw)) = (parts.next(), parts.next()) else {
             continue;
         };
-        let value = raw.parse::<i64>().unwrap_or(0).max(0) as u64;
+        let value = raw.parse::<u64>().ok();
         match key {
             "pswpin" => sample.pswpin = value,
             "pswpout" => sample.pswpout = value,
@@ -78,11 +81,14 @@ pub fn swap_rates(previous: &TimedSample, current: &TimedSample) -> Option<SwapR
     if elapsed <= 0.0 {
         return None;
     }
-    let in_delta = current.sample.pswpin.checked_sub(previous.sample.pswpin)?;
+    let in_delta = current
+        .sample
+        .pswpin?
+        .checked_sub(previous.sample.pswpin?)?;
     let out_delta = current
         .sample
-        .pswpout
-        .checked_sub(previous.sample.pswpout)?;
+        .pswpout?
+        .checked_sub(previous.sample.pswpout?)?;
     Some(SwapRates {
         in_per_sec: in_delta as f64 / elapsed,
         out_per_sec: out_delta as f64 / elapsed,
@@ -161,14 +167,14 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         assert_eq!(
             sample,
             VmstatSample {
-                pswpin: 1200,
-                pswpout: 3400
+                pswpin: Some(1200),
+                pswpout: Some(3400)
             }
         );
     }
 
     #[test]
-    fn vmstat_with_missing_keys_reads_as_zero() {
+    fn vmstat_with_missing_keys_stays_unavailable() {
         assert_eq!(parse_vmstat("pgfault 42\n"), VmstatSample::default());
         assert_eq!(parse_vmstat(""), VmstatSample::default());
     }
@@ -176,8 +182,8 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
     #[test]
     fn vmstat_ignores_malformed_lines_and_negative_values() {
         let sample = parse_vmstat("pswpin nope\npswpout -5\nbroken\npswpin 7\n");
-        assert_eq!(sample.pswpin, 7);
-        assert_eq!(sample.pswpout, 0);
+        assert_eq!(sample.pswpin, Some(7));
+        assert_eq!(sample.pswpout, None);
     }
 
     #[test]
@@ -191,15 +197,15 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         let start = Instant::now();
         let previous = TimedSample {
             sample: VmstatSample {
-                pswpin: 1000,
-                pswpout: 2000,
+                pswpin: Some(1000),
+                pswpout: Some(2000),
             },
             at: start,
         };
         let current = TimedSample {
             sample: VmstatSample {
-                pswpin: 1100,
-                pswpout: 2200,
+                pswpin: Some(1100),
+                pswpout: Some(2200),
             },
             at: start + Duration::from_secs(10),
         };
@@ -213,8 +219,8 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         let at = Instant::now();
         let sample = TimedSample {
             sample: VmstatSample {
-                pswpin: 50,
-                pswpout: 60,
+                pswpin: Some(50),
+                pswpout: Some(60),
             },
             at,
         };
@@ -232,23 +238,23 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         let at = Instant::now();
         let sample = TimedSample {
             sample: VmstatSample {
-                pswpin: 1,
-                pswpout: 1,
+                pswpin: Some(1),
+                pswpout: Some(1),
             },
             at,
         };
         assert!(swap_rates(&sample, &sample).is_none());
         let earlier = TimedSample {
             sample: VmstatSample {
-                pswpin: 0,
-                pswpout: 0,
+                pswpin: Some(0),
+                pswpout: Some(0),
             },
             at,
         };
         let later = TimedSample {
             sample: VmstatSample {
-                pswpin: 10,
-                pswpout: 10,
+                pswpin: Some(10),
+                pswpout: Some(10),
             },
             at: at + Duration::from_secs(1),
         };
@@ -260,15 +266,15 @@ full avg10=0.31 avg60=0.12 avg300=0.02 total=23456
         let start = Instant::now();
         let previous = TimedSample {
             sample: VmstatSample {
-                pswpin: 9000,
-                pswpout: 9000,
+                pswpin: Some(9000),
+                pswpout: Some(9000),
             },
             at: start,
         };
         let current = TimedSample {
             sample: VmstatSample {
-                pswpin: 100,
-                pswpout: 200,
+                pswpin: Some(100),
+                pswpout: Some(200),
             },
             at: start + Duration::from_secs(10),
         };

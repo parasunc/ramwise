@@ -554,6 +554,10 @@ async fn run_app(
             // Insights panel
             let insights = InsightsPanelWidget::new(app.analyzer.insights(), &app.theme)
                 .focused(app.focus == Focus::InsightsPanel);
+            let insights = match &app.snapshot {
+                Some(snapshot) => insights.pressure(&snapshot.system),
+                None => insights,
+            };
             frame.render_widget(insights, areas.bottom);
 
             // Help overlay
