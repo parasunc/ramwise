@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::collector::ProcessMemory;
+use crate::process_view::{ProcessFilter, depth_of};
 use crate::ui::Theme;
 use crate::utils::format_bytes;
 
@@ -21,6 +22,7 @@ pub enum SortMode {
     Private,
     Name,
     Pid,
+    Category,
 }
 
 impl SortMode {
@@ -31,6 +33,7 @@ impl SortMode {
             SortMode::Private => "Private",
             SortMode::Name => "Name",
             SortMode::Pid => "PID",
+            SortMode::Category => "Category",
         }
     }
 
@@ -40,7 +43,8 @@ impl SortMode {
             SortMode::Pss => SortMode::Private,
             SortMode::Private => SortMode::Name,
             SortMode::Name => SortMode::Pid,
-            SortMode::Pid => SortMode::Rss,
+            SortMode::Pid => SortMode::Category,
+            SortMode::Category => SortMode::Rss,
         }
     }
 }
@@ -50,6 +54,10 @@ pub struct ProcessListState {
     pub list_state: ListState,
     pub sort_mode: SortMode,
     pub selected_pid: Option<i32>,
+    /// Active memory filters; applied before sorting.
+    pub filter: ProcessFilter,
+    /// Tree mode reorders into ppid preorder with indentation.
+    pub tree_mode: bool,
 }
 
 impl ProcessListState {
@@ -60,6 +68,8 @@ impl ProcessListState {
             list_state: state,
             sort_mode: SortMode::Rss,
             selected_pid: None,
+            filter: ProcessFilter::default(),
+            tree_mode: false,
         }
     }
 
@@ -108,6 +118,7 @@ pub struct ProcessListWidget<'a> {
     theme: &'a Theme,
     focused: bool,
     total_memory: u64,
+    tree_mode: bool,
 }
 
 impl<'a> ProcessListWidget<'a> {
@@ -117,11 +128,17 @@ impl<'a> ProcessListWidget<'a> {
             theme,
             focused: true,
             total_memory,
+            tree_mode: false,
         }
     }
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    pub fn tree_mode(mut self, tree_mode: bool) -> Self {
+        self.tree_mode = tree_mode;
         self
     }
 }
@@ -159,11 +176,18 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
                     _ => Span::styled("  ", Style::default()),
                 };
 
-                // Truncate name if needed
-                let name = if proc.name.len() > name_width {
-                    format!("{}…", &proc.name[..name_width.saturating_sub(1)])
+                // Truncate name if needed; tree mode indents by ppid depth
+                let prefix = if self.tree_mode {
+                    let depth = depth_of(self.processes, proc.pid).min(8);
+                    format!("{}└ ", "  ".repeat(depth))
                 } else {
-                    format!("{:<width$}", proc.name, width = name_width)
+                    String::new()
+                };
+                let display = format!("{prefix}{}", proc.name);
+                let name = if display.len() > name_width {
+                    format!("{}…", &display[..name_width.saturating_sub(1)])
+                } else {
+                    format!("{:<width$}", display, width = name_width)
                 };
 
                 // Name styling - brighter for selected, dimmer for lower ranks
@@ -219,7 +243,7 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
         }
 
         // Modern title with sort indicator
-        let title_spans = vec![
+        let mut title_spans = vec![
             Span::styled(" ", Style::default()),
             Span::styled(
                 "Processes",
@@ -234,8 +258,17 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
                     .fg(self.theme.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ", Style::default()),
         ];
+        if self.tree_mode {
+            title_spans.push(Span::styled(" · tree", self.theme.muted_style()));
+        }
+        if let Some(label) = state.filter.label() {
+            title_spans.push(Span::styled(
+                format!(" · {label}"),
+                Style::default().fg(self.theme.warning),
+            ));
+        }
+        title_spans.push(Span::styled(" ", Style::default()));
         let title = Line::from(title_spans);
 
         // Build block with rounded corners feel
