@@ -5,9 +5,11 @@
 
 mod analyzer;
 mod app;
+mod categories;
 mod collector;
 mod history;
 mod process_control;
+mod process_view;
 mod ui;
 mod utils;
 
@@ -57,6 +59,18 @@ struct Args {
     /// Disable smaps collection (faster but less detailed)
     #[arg(long)]
     no_smaps: bool,
+
+    /// Show only processes with no shared memory
+    #[arg(long)]
+    only_private: bool,
+
+    /// Show only processes with some shared memory
+    #[arg(long, conflicts_with = "only_private")]
+    only_shared: bool,
+
+    /// Minimum process PSS to display (in MB)
+    #[arg(long, default_value = "0")]
+    min_pss: u64,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -460,6 +474,11 @@ async fn run_tui(args: &Args) -> Result<()> {
 
     // Create app
     let mut app = App::new(&args.theme);
+    app.process_list_state.filter = process_view::ProcessFilter {
+        only_private: args.only_private,
+        only_shared: args.only_shared,
+        min_pss_bytes: args.min_pss * 1024 * 1024,
+    };
 
     // Create collector
     let collector = build_collector(args);
@@ -525,7 +544,8 @@ async fn run_app(
                 let theme = app.theme.clone();
 
                 let process_list = ProcessListWidget::new(&processes, &theme, total_mem)
-                    .focused(focus == Focus::ProcessList);
+                    .focused(focus == Focus::ProcessList)
+                    .tree_mode(app.process_list_state.tree_mode);
 
                 frame.render_stateful_widget(
                     process_list,
@@ -620,6 +640,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame, theme: &ui::Theme) {
 
   Process List:
     s            Cycle sort mode
+    f / F        Cycle memory filter / PSS floor
+    t            Toggle process tree
     g            Go to top
     G            Go to bottom
     x            Send SIGTERM

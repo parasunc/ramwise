@@ -131,28 +131,13 @@ impl App {
 
     /// Update sorted process list based on current sort mode
     fn update_sorted_processes(&mut self, snapshot: &MemorySnapshot) {
-        self.sorted_processes = snapshot.processes.clone();
-
-        match self.process_list_state.sort_mode {
-            SortMode::Rss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.rss));
-            }
-            SortMode::Pss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.pss));
-            }
-            SortMode::Private => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.private));
-            }
-            SortMode::Name => {
-                self.sorted_processes.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortMode::Pid => {
-                self.sorted_processes.sort_by_key(|a| a.pid);
-            }
-        }
+        self.sorted_processes = snapshot
+            .processes
+            .iter()
+            .filter(|process| self.process_list_state.filter.matches(process))
+            .cloned()
+            .collect();
+        self.sort_and_order();
     }
 
     /// Update selection after sort change
@@ -179,27 +164,21 @@ impl App {
 
     /// Re-sort existing processes (for sort mode change)
     fn resort_processes(&mut self) {
-        match self.process_list_state.sort_mode {
-            SortMode::Rss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.rss));
-            }
-            SortMode::Pss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.pss));
-            }
-            SortMode::Private => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.private));
-            }
-            SortMode::Name => {
-                self.sorted_processes.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortMode::Pid => {
-                self.sorted_processes.sort_by_key(|a| a.pid);
-            }
-        }
+        self.sort_and_order();
         self.update_selection();
+    }
+
+    /// Sort, then optionally reorder into ppid preorder for tree mode.
+    /// Filtering already happened on snapshot ingest, so re-sorting the
+    /// cached (filtered) slice stays idempotent.
+    fn sort_and_order(&mut self) {
+        sort_processes(
+            &mut self.sorted_processes,
+            self.process_list_state.sort_mode,
+        );
+        if self.process_list_state.tree_mode {
+            crate::process_view::order_as_tree(&mut self.sorted_processes);
+        }
     }
 
     /// Get sorted processes
@@ -272,6 +251,18 @@ impl App {
                 self.process_list_state.cycle_sort();
                 self.resort_processes();
             }
+            KeyCode::Char('f') => {
+                self.cycle_memory_filter();
+                self.resort_processes();
+            }
+            KeyCode::Char('F') => {
+                self.cycle_min_pss();
+                self.resort_processes();
+            }
+            KeyCode::Char('t') => {
+                self.process_list_state.tree_mode = !self.process_list_state.tree_mode;
+                self.resort_processes();
+            }
             KeyCode::Home | KeyCode::Char('g') => {
                 if !self.sorted_processes.is_empty() {
                     self.process_list_state.list_state.select(Some(0));
@@ -306,6 +297,30 @@ impl App {
         {
             self.process_list_state.selected_pid = Some(proc.pid);
         }
+    }
+
+    /// Cycle the memory-type filter: off → private-only → shared-only → off.
+    fn cycle_memory_filter(&mut self) {
+        let filter = &mut self.process_list_state.filter;
+        if !filter.only_private && !filter.only_shared {
+            filter.only_private = true;
+        } else if filter.only_private {
+            filter.only_private = false;
+            filter.only_shared = true;
+        } else {
+            filter.only_shared = false;
+        }
+    }
+
+    /// Cycle the PSS floor: none → 10 MB → 100 MB → none.
+    fn cycle_min_pss(&mut self) {
+        const MB: u64 = 1024 * 1024;
+        let filter = &mut self.process_list_state.filter;
+        filter.min_pss_bytes = match filter.min_pss_bytes {
+            0 => 10 * MB,
+            v if v < 100 * MB => 100 * MB,
+            _ => 0,
+        };
     }
 
     /// Remove expired transient messages.
@@ -442,6 +457,46 @@ mod tests {
     }
 
     #[test]
+    fn update_applies_filters_before_sorting() {
+        let mut app = App::default();
+        app.process_list_state.filter = crate::process_view::ProcessFilter {
+            only_private: true,
+            ..Default::default()
+        };
+        let snapshot = crate::test_support::snapshot_at(std::time::Instant::now(), 100);
+        app.update(snapshot);
+        // The fixture process shares memory, so the private-only filter
+        // removes it while the snapshot itself is untouched.
+        assert!(app.processes().is_empty());
+        assert_eq!(app.snapshot.as_ref().unwrap().processes.len(), 1);
+    }
+
+    #[test]
+    fn tree_toggle_reorders_without_losing_processes() {
+        let mut app = App::default();
+        let mut snapshot = crate::test_support::snapshot_at(std::time::Instant::now(), 100);
+        snapshot.processes.push(crate::collector::ProcessMemory {
+            pid: 99,
+            ppid: crate::test_support::FIXTURE_PID,
+            name: "child".into(),
+            rss: 10,
+            vss: 10,
+            ..Default::default()
+        });
+        app.update(snapshot);
+        app.process_list_state.tree_mode = true;
+        app.resort_processes();
+        let pids: Vec<i32> = app.processes().iter().map(|p| p.pid).collect();
+        assert_eq!(pids.len(), 2);
+        let parent = pids
+            .iter()
+            .position(|pid| *pid == crate::test_support::FIXTURE_PID)
+            .unwrap();
+        let child = pids.iter().position(|pid| *pid == 99).unwrap();
+        assert!(parent < child);
+    }
+
+    #[test]
     fn app_theme_selection() {
         let app_light = App::new("light");
         assert_eq!(app_light.theme.bg, Theme::light().bg);
@@ -451,5 +506,61 @@ mod tests {
 
         let app_fallback = App::new("unknown-theme");
         assert_eq!(app_fallback.theme.bg, Theme::dark().bg);
+    }
+
+    #[test]
+    fn category_sort_groups_before_flat_orders() {
+        let mut processes = vec![
+            crate::collector::ProcessMemory {
+                pid: 1,
+                name: "kworker".into(),
+                rss: 900,
+                vss: 900,
+                ..Default::default()
+            },
+            crate::collector::ProcessMemory {
+                pid: 2,
+                name: "firefox".into(),
+                cmdline: "firefox".into(),
+                rss: 100,
+                vss: 200,
+                ..Default::default()
+            },
+        ];
+        sort_processes(&mut processes, SortMode::Category);
+        assert_eq!(processes[0].pid, 2);
+        assert_eq!(processes[1].pid, 1);
+    }
+}
+
+/// Sort one process slice by mode. Shared by snapshot updates and sort-mode
+/// changes so both paths order identically; the Category mode groups by
+/// category rank (user apps first, system last) with RSS descending inside
+/// each group, giving a grouped view next to the flat sorts.
+fn sort_processes(processes: &mut [ProcessMemory], mode: SortMode) {
+    match mode {
+        SortMode::Rss => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.rss));
+        }
+        SortMode::Pss => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.pss));
+        }
+        SortMode::Private => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.private));
+        }
+        SortMode::Name => {
+            processes.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        SortMode::Pid => {
+            processes.sort_by_key(|a| a.pid);
+        }
+        SortMode::Category => {
+            processes.sort_by_key(|a| {
+                (
+                    crate::categories::classify(a).rank(),
+                    std::cmp::Reverse(a.rss),
+                )
+            });
+        }
     }
 }
