@@ -132,27 +132,10 @@ impl App {
     /// Update sorted process list based on current sort mode
     fn update_sorted_processes(&mut self, snapshot: &MemorySnapshot) {
         self.sorted_processes = snapshot.processes.clone();
-
-        match self.process_list_state.sort_mode {
-            SortMode::Rss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.rss));
-            }
-            SortMode::Pss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.pss));
-            }
-            SortMode::Private => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.private));
-            }
-            SortMode::Name => {
-                self.sorted_processes.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortMode::Pid => {
-                self.sorted_processes.sort_by_key(|a| a.pid);
-            }
-        }
+        sort_processes(
+            &mut self.sorted_processes,
+            self.process_list_state.sort_mode,
+        );
     }
 
     /// Update selection after sort change
@@ -179,26 +162,10 @@ impl App {
 
     /// Re-sort existing processes (for sort mode change)
     fn resort_processes(&mut self) {
-        match self.process_list_state.sort_mode {
-            SortMode::Rss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.rss));
-            }
-            SortMode::Pss => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.pss));
-            }
-            SortMode::Private => {
-                self.sorted_processes
-                    .sort_by_key(|a| std::cmp::Reverse(a.private));
-            }
-            SortMode::Name => {
-                self.sorted_processes.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            SortMode::Pid => {
-                self.sorted_processes.sort_by_key(|a| a.pid);
-            }
-        }
+        sort_processes(
+            &mut self.sorted_processes,
+            self.process_list_state.sort_mode,
+        );
         self.update_selection();
     }
 
@@ -451,5 +418,62 @@ mod tests {
 
         let app_fallback = App::new("unknown-theme");
         assert_eq!(app_fallback.theme.bg, Theme::dark().bg);
+    }
+
+    #[test]
+    fn category_sort_groups_before_flat_orders() {
+        let mut processes = vec![
+            crate::collector::ProcessMemory {
+                pid: 1,
+                name: "kworker".into(),
+                rss: 900,
+                vss: 900,
+                ..Default::default()
+            },
+            crate::collector::ProcessMemory {
+                pid: 2,
+                name: "firefox".into(),
+                cmdline: "firefox".into(),
+                rss: 100,
+                vss: 200,
+                ..Default::default()
+            },
+        ];
+        sort_processes(&mut processes, SortMode::Category);
+        assert_eq!(processes[0].pid, 2);
+        assert_eq!(processes[1].pid, 1);
+    }
+}
+
+/// Sort one process slice by mode. Shared by snapshot updates and sort-mode
+/// changes so both paths order identically; the Category mode groups by
+/// category rank (user apps first, system last) with RSS descending inside
+/// each group, giving a grouped view next to the flat sorts.
+fn sort_processes(processes: &mut [ProcessMemory], mode: SortMode) {
+    match mode {
+        SortMode::Rss => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.rss));
+        }
+        SortMode::Pss => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.pss));
+        }
+        SortMode::Private => {
+            processes.sort_by_key(|a| std::cmp::Reverse(a.private));
+        }
+        SortMode::Name => {
+            processes.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        SortMode::Pid => {
+            processes.sort_by_key(|a| a.pid);
+        }
+        SortMode::Category => {
+            processes.sort_by_key(|a| {
+                (
+                    crate::categories::classify(a).rank(),
+                    std::cmp::Reverse(a.rss),
+                    a.pid,
+                )
+            });
+        }
     }
 }

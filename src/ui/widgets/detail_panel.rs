@@ -123,6 +123,18 @@ impl<'a> Widget for DetailPanelWidget<'a> {
             Style::default().fg(self.theme.fg_muted),
         )]));
 
+        // Heuristic category label so the classification is visible per process
+        let category = crate::categories::classify(proc);
+        lines.push(Line::from(vec![
+            Span::styled("Category ", self.theme.muted_style()),
+            Span::styled(
+                category.label(),
+                Style::default()
+                    .fg(self.theme.secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
         lines.push(Line::from(""));
 
         // Memory section header

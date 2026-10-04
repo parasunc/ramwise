@@ -21,6 +21,7 @@ pub enum SortMode {
     Private,
     Name,
     Pid,
+    Category,
 }
 
 impl SortMode {
@@ -31,6 +32,7 @@ impl SortMode {
             SortMode::Private => "Private",
             SortMode::Name => "Name",
             SortMode::Pid => "PID",
+            SortMode::Category => "Category",
         }
     }
 
@@ -40,7 +42,8 @@ impl SortMode {
             SortMode::Pss => SortMode::Private,
             SortMode::Private => SortMode::Name,
             SortMode::Name => SortMode::Pid,
-            SortMode::Pid => SortMode::Rss,
+            SortMode::Pid => SortMode::Category,
+            SortMode::Category => SortMode::Rss,
         }
     }
 }

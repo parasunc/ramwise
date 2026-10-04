@@ -5,6 +5,7 @@
 
 mod analyzer;
 mod app;
+mod categories;
 mod collector;
 mod history;
 mod process_control;
