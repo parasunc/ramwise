@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::collector::ProcessMemory;
+use crate::process_view::{ProcessFilter, forest_depths};
 use crate::ui::Theme;
 use crate::utils::format_bytes;
 
@@ -21,6 +22,7 @@ pub enum SortMode {
     Private,
     Name,
     Pid,
+    Category,
 }
 
 impl SortMode {
@@ -31,6 +33,7 @@ impl SortMode {
             SortMode::Private => "Private",
             SortMode::Name => "Name",
             SortMode::Pid => "PID",
+            SortMode::Category => "Category",
         }
     }
 
@@ -40,7 +43,8 @@ impl SortMode {
             SortMode::Pss => SortMode::Private,
             SortMode::Private => SortMode::Name,
             SortMode::Name => SortMode::Pid,
-            SortMode::Pid => SortMode::Rss,
+            SortMode::Pid => SortMode::Category,
+            SortMode::Category => SortMode::Rss,
         }
     }
 }
@@ -50,6 +54,10 @@ pub struct ProcessListState {
     pub list_state: ListState,
     pub sort_mode: SortMode,
     pub selected_pid: Option<i32>,
+    /// Active memory filters; applied before sorting.
+    pub filter: ProcessFilter,
+    /// Tree mode reorders into ppid preorder with indentation.
+    pub tree_mode: bool,
 }
 
 impl ProcessListState {
@@ -60,6 +68,8 @@ impl ProcessListState {
             list_state: state,
             sort_mode: SortMode::Rss,
             selected_pid: None,
+            filter: ProcessFilter::default(),
+            tree_mode: false,
         }
     }
 
@@ -108,6 +118,7 @@ pub struct ProcessListWidget<'a> {
     theme: &'a Theme,
     focused: bool,
     total_memory: u64,
+    tree_mode: bool,
 }
 
 impl<'a> ProcessListWidget<'a> {
@@ -117,11 +128,17 @@ impl<'a> ProcessListWidget<'a> {
             theme,
             focused: true,
             total_memory,
+            tree_mode: false,
         }
     }
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    pub fn tree_mode(mut self, tree_mode: bool) -> Self {
+        self.tree_mode = tree_mode;
         self
     }
 }
@@ -137,6 +154,14 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
         let name_width = inner_width.saturating_sub(22).min(20);
         let mem_width = 8;
         let bar_width = inner_width.saturating_sub(name_width + mem_width + 4);
+
+        // Depths computed once per frame over a shared parent map instead
+        // of once per row.
+        let depths = if self.tree_mode {
+            forest_depths(self.processes)
+        } else {
+            std::collections::HashMap::new()
+        };
 
         // Build list items with modern styling
         let items: Vec<ListItem> = self
@@ -159,12 +184,17 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
                     _ => Span::styled("  ", Style::default()),
                 };
 
-                // Truncate name if needed
-                let name = if proc.name.len() > name_width {
-                    format!("{}…", &proc.name[..name_width.saturating_sub(1)])
+                // Truncate name if needed; tree mode indents by ppid depth.
+                // Truncation is char-boundary safe: byte slicing panics on
+                // multi-byte process names.
+                let prefix = if self.tree_mode {
+                    let depth = depths.get(&proc.pid).copied().unwrap_or(0).min(8);
+                    format!("{}└ ", "  ".repeat(depth))
                 } else {
-                    format!("{:<width$}", proc.name, width = name_width)
+                    String::new()
                 };
+                let display = format!("{prefix}{}", proc.name);
+                let name = truncate_to(&display, name_width);
 
                 // Name styling - brighter for selected, dimmer for lower ranks
                 let name_style = if is_selected {
@@ -219,7 +249,7 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
         }
 
         // Modern title with sort indicator
-        let title_spans = vec![
+        let mut title_spans = vec![
             Span::styled(" ", Style::default()),
             Span::styled(
                 "Processes",
@@ -234,8 +264,17 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
                     .fg(self.theme.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ", Style::default()),
         ];
+        if self.tree_mode {
+            title_spans.push(Span::styled(" · tree", self.theme.muted_style()));
+        }
+        if let Some(label) = state.filter.label() {
+            title_spans.push(Span::styled(
+                format!(" · {label}"),
+                Style::default().fg(self.theme.warning),
+            ));
+        }
+        title_spans.push(Span::styled(" ", Style::default()));
         let title = Line::from(title_spans);
 
         // Build block with rounded corners feel
@@ -252,6 +291,18 @@ impl<'a> StatefulWidget for ProcessListWidget<'a> {
             .highlight_symbol("▸ ");
 
         StatefulWidget::render(list, area, buf, &mut state.list_state);
+    }
+}
+
+/// Truncate to a character width with an ellipsis, never splitting a
+/// multi-byte character. Pads short strings to the width for column layout.
+fn truncate_to(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > max_chars {
+        let end = max_chars.saturating_sub(1);
+        format!("{}…", chars[..end].iter().collect::<String>())
+    } else {
+        format!("{text:<width$}", width = max_chars)
     }
 }
 
@@ -276,4 +327,18 @@ fn create_sleek_bar(percent: f64, width: usize) -> String {
     bar.push_str(&"░".repeat(remaining));
 
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_never_splits_characters() {
+        assert_eq!(truncate_to("abcdef", 4), "abc…");
+        assert_eq!(truncate_to("ab", 4), "ab  ");
+        // Multi-byte name: byte slicing would panic, chars do not.
+        assert_eq!(truncate_to("日本語プロセス", 4), "日本語…");
+        assert_eq!(truncate_to("", 4), "    ");
+    }
 }
