@@ -66,6 +66,10 @@ struct Args {
     #[arg(short, long, default_value = "dark")]
     theme: String,
 
+    /// Custom file for theme
+    #[arg(long, default_value = "$HOME/.config/ramwise/theme.toml")]
+    custom_theme_file: String,
+
     /// Print one compact JSON snapshot to stdout and exit (exit 0 on
     /// success, non-zero when collection fails; diagnostics go to stderr).
     /// Combines with --tiny: JSON prints first, then the status line.
@@ -459,7 +463,7 @@ async fn run_tui(args: &Args) -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
 
     // Create app
-    let mut app = App::new(&args.theme);
+    let mut app = App::new(&args.theme, &args.custom_theme_file);
 
     // Create collector
     let collector = build_collector(args);
@@ -498,7 +502,7 @@ async fn run_app(
     app: &mut App,
     rx: &mut mpsc::Receiver<collector::MemorySnapshot>,
 ) -> Result<()> {
-    let layout = Layout::new();
+    let layout = Layout::new(app.theme.clone());
 
     loop {
         app.prune_transient_state();
@@ -727,6 +731,7 @@ mod tests {
             no_smaps: false,
             debug: false,
             theme: "dark".into(),
+            custom_theme_file: "$HOME/.config/ramwise/theme.toml".to_string(),
             tiny,
             once,
             watch,
